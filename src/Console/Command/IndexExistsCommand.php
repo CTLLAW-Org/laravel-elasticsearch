@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace MailerLite\LaravelElasticsearch\Console\Command;
 
-use Elastic\Elasticsearch\Client;
+use Elasticsearch\Client;
 use Illuminate\Console\Command;
 
 final class IndexExistsCommand extends Command

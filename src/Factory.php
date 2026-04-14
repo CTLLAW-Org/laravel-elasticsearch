@@ -2,14 +2,14 @@
 
 namespace MailerLite\LaravelElasticsearch;
 
-use Elastic\Elasticsearch\Client;
-use Elastic\Elasticsearch\ClientBuilder;
-use GuzzleHttp\Client as GuzzleClient;
-use GuzzleHttp\HandlerStack;
-use GuzzleHttp\Middleware;
+use Elasticsearch\Client;
+use Elasticsearch\ClientBuilder;
+use GuzzleHttp\Psr7\Request;
+use GuzzleHttp\Psr7\Uri;
+use GuzzleHttp\Ring\Future\CompletedFutureArray;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Reflector;
-use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
 use Psr\Log\LoggerInterface;
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
@@ -18,12 +18,30 @@ use Monolog\Handler\StreamHandler;
 class Factory
 {
 	/**
+	 * Map configuration array keys with ES ClientBuilder setters
+	 *
+	 * @var array
+	 */
+	protected $configMappings = [
+		'sslVerification'    => 'setSSLVerification',
+		'sniffOnStart'       => 'setSniffOnStart',
+		'retries'            => 'setRetries',
+		'httpHandler'        => 'setHandler',
+		'connectionPool'     => 'setConnectionPool',
+		'connectionSelector' => 'setSelector',
+		'serializer'         => 'setSerializer',
+		'connectionFactory'  => 'setConnectionFactory',
+		'endpoint'           => 'setEndpoint',
+		'namespaces'         => 'registerNamespace',
+	];
+
+	/**
 	 * Make the Elasticsearch client for the given named configuration, or
 	 * the default client.
 	 *
 	 * @param array $config
 	 *
-	 * @return \Elastic\Elasticsearch\Client
+	 * @return \Elasticsearch\Client
 	 */
 	public function make(array $config): Client
 	{
@@ -35,15 +53,14 @@ class Factory
 	 *
 	 * @param array $config
 	 *
-	 * @return \Elastic\Elasticsearch\Client
+	 * @return \Elasticsearch\Client
 	 */
 	protected function buildClient(array $config): Client
 	{
 		$clientBuilder = ClientBuilder::create();
 
 		// Configure hosts
-		$hosts = $this->buildHosts($config['hosts']);
-		$clientBuilder->setHosts($hosts);
+		$clientBuilder->setHosts($config['hosts']);
 
 		// Configure logging
 		if (Arr::get($config, 'logging')) {
@@ -60,101 +77,55 @@ class Factory
 			}
 		}
 
-		// Configure retries
-		$retries = Arr::get($config, 'retries');
-		if ($retries !== null) {
-			$clientBuilder->setRetries((int) $retries);
+		// Configure tracer
+		if ($tracer = Arr::get($config, 'tracer')) {
+			$clientBuilder->setTracer(app($tracer));
 		}
 
-		// Configure SSL verification
-		$sslVerification = Arr::get($config, 'sslVerification');
-		if ($sslVerification !== null) {
-			if (is_string($sslVerification)) {
-				$clientBuilder->setCABundle($sslVerification);
-			} elseif ($sslVerification === false) {
-				$clientBuilder->setSSLVerification(false);
+		// Set additional client configuration
+		foreach ($this->configMappings as $key => $method) {
+			$value = Arr::get($config, $key);
+			if (is_array($value)) {
+				foreach ($value as $vItem) {
+					$clientBuilder->$method($vItem);
+				}
+			} elseif ($value !== null) {
+				$clientBuilder->$method($value);
 			}
 		}
 
-		// Configure basic authentication from the first host
-		$firstHost = Arr::first($config['hosts']);
-		if (!empty($firstHost['user']) && !empty($firstHost['pass'])) {
-			$clientBuilder->setBasicAuthentication($firstHost['user'], $firstHost['pass']);
-		}
-
-		// Configure API key authentication
-		if (!empty($firstHost['api_key']) && $firstHost['api_key'] !== null) {
-			$apiId = $firstHost['api_id'] ?? null;
-			if (!empty($apiId)) {
-				$clientBuilder->setApiKey($firstHost['api_key'], $apiId);
-			} else {
-				$clientBuilder->setApiKey($firstHost['api_key']);
-			}
-		}
-
-		// Configure AWS handler
-		$this->configureAwsHandler($clientBuilder, $config);
-
-		// Build and return the client
-		return $clientBuilder->build();
-	}
-
-	/**
-	 * Build host URLs from the configuration arrays.
-	 *
-	 * @param array $hosts
-	 * @return array
-	 */
-	protected function buildHosts(array $hosts): array
-	{
-		$builtHosts = [];
-
-		foreach ($hosts as $host) {
-			if (is_string($host)) {
-				$builtHosts[] = $host;
-				continue;
-			}
-
-			$scheme = Arr::get($host, 'scheme', 'http');
-			$hostname = Arr::get($host, 'host', 'localhost');
-			$port = Arr::get($host, 'port');
-
-			$url = $scheme . '://' . $hostname;
-			if ($port) {
-				$url .= ':' . $port;
-			}
-
-			$builtHosts[] = $url;
-		}
-
-		return $builtHosts;
-	}
-
-	/**
-	 * Configure AWS SigV4 signing via a Guzzle middleware if any host has AWS enabled.
-	 *
-	 * @param ClientBuilder $clientBuilder
-	 * @param array $config
-	 */
-	protected function configureAwsHandler(ClientBuilder $clientBuilder, array $config): void
-	{
+		// Configure handlers for any AWS hosts
 		foreach ($config['hosts'] as $host) {
 			if (isset($host['aws']) && $host['aws']) {
-				$stack = HandlerStack::create();
-
-				$stack->push(Middleware::mapRequest(function (RequestInterface $request) use ($host) {
+				$clientBuilder->setHandler(function (array $request) use ($host) {
+					$psr7Handler = \Aws\default_http_handler();
 					$signer = new \Aws\Signature\SignatureV4('es', $host['aws_region']);
+					$request['headers']['Host'][0] = parse_url($request['headers']['Host'][0])['host'] ?? $request['headers']['Host'][0];
 
+					// Create a PSR-7 request from the array passed to the handler
+					$psr7Request = new Request(
+						$request['http_method'],
+						(new Uri($request['uri']))
+							->withScheme($request['scheme'])
+							->withPort($host['port'])
+							->withHost($request['headers']['Host'][0]),
+						$request['headers'],
+						$request['body']
+					);
+
+					// Create the Credentials instance with the credentials from the environment
 					$credentials = new \Aws\Credentials\Credentials(
 						$host['aws_key'],
 						$host['aws_secret'],
 						$host['aws_session_token'] ?? null
 					);
-
+					// check if the aws_credentials from config is set and if it contains a Credentials instance
 					if (!empty($host['aws_credentials']) && $host['aws_credentials'] instanceof \Aws\Credentials\Credentials) {
+						// Set the credentials as in config
 						$credentials = $host['aws_credentials'];
 					}
 
+					// If the aws_credentials is an array try using it as a static method of the class
 					if (
 						!empty($host['aws_credentials'])
 						&& is_array($host['aws_credentials'])
@@ -164,17 +135,58 @@ class Factory
 					}
 
 					if (!empty($host['aws_credentials']) && $host['aws_credentials'] instanceof \Closure) {
+						// If it contains a closure you can obtain the credentials by invoking it
 						$credentials = $host['aws_credentials']()->wait();
 					}
 
-					return $signer->signRequest($request, $credentials);
-				}));
+					// Sign the PSR-7 request
+					$signedRequest = $signer->signRequest(
+						$psr7Request,
+						$credentials
+					);
 
-				$guzzleClient = new GuzzleClient(['handler' => $stack]);
-				$clientBuilder->setHttpClient($guzzleClient);
+					// Get curl stats
+					$http_stats = new class
+					{
+						public $data = [];
+						public function __invoke(...$args)
+						{
+							$this->data = $args[0];
+						}
+					};
 
-				break; // Only one AWS handler needed
+					// Send the signed request to Amazon ES
+					$response = $psr7Handler($signedRequest, ['http_stats_receiver' => $http_stats])
+						->then(function (ResponseInterface $response) {
+							return $response;
+						}, function ($error) {
+							return $error['response'];
+						})
+						->wait();
+
+					// Convert the PSR-7 response to a RingPHP response
+					return new CompletedFutureArray([
+						'status'         => $response->getStatusCode(),
+						'headers'        => $response->getHeaders(),
+						'body'           => $response->getBody()->detach(),
+						'transfer_stats' => [
+							'total_time'   => $http_stats->data['total_time'] ?? 0,
+							'primary_port' => $http_stats->data['primary_port'] ?? '',
+						],
+						'effective_url'  => (string) $psr7Request->getUri(),
+					]);
+				});
 			}
 		}
+
+		// Build and return the client
+		if (
+			!empty($host['api_id']) && $host['api_id'] !== null &&
+			!empty($host['api_key']) && $host['api_key'] !== null
+		) {
+			$clientBuilder->setApiKey($host['api_id'], $host['api_key']);
+		}
+
+		return $clientBuilder->build();
 	}
 }
